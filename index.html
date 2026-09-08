@@ -591,6 +591,7 @@ const SUPABASE_KEY = 'sb_publishable_BqALINfN4CbY-Utg5rYArA_Tb5tItSh';
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzEa4ysie0yf2pXM7RTqA13bRu3ZaIrEJ9jl0jhiE8DnHz5rQZZDIa0LR2QVnKz01BKzQ/exec';
 const RECEIPT_FOLDER_ID = '1xqrEk9SksSRaHZUEIsni0zyDg4i_LShg';
 const TABLE = 'wood_records';
+const STATUS_PAGE_URL = 'https://superjett059-jpg.github.io/wood-RTI2/status.html';
 
 const sb = {
     headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
@@ -677,7 +678,7 @@ const dataService = {
                         }
                         
                         const historyLines = summary.payments.map(p => {
-                            const slipPart = p.slipUrl ? ` [สลิป: ${p.slipUrl}]` : '';
+                            const slipPart = p.slipUrl ? ' [มีสลิป]' : '';
                             const refPart = p.ref ? `(${p.ref})` : '';
                             return `• ${p.date}: จ่าย ${p.amount.toLocaleString('th-TH', { minimumFractionDigits: 2 })} บาท ${refPart}${slipPart}`;
                         });
@@ -792,13 +793,14 @@ function getBillPaymentSummary(r) {
         const linesText = structuredMatch[2].trim();
         const lines = linesText.split('\n');
         lines.forEach(line => {
-            const lineMatch = line.match(/•\s*(.*?):\s*จ่าย\s*([0-9,.]+)\s*บาท\s*(?:\((.*?)\))?\s*(?:\[สลิป:\s*(.*?)\])?/);
+            const lineMatch = line.match(/•\s*(.*?):\s*จ่าย\s*([0-9,.]+)\s*บาท\s*(?:\((.*?)\))?\s*(?:\[(?:สลิป:\s*(.*?)|มีสลิป)\])?/);
             if (lineMatch) {
+                const rawUrl = lineMatch[4] ? lineMatch[4].trim() : '';
                 summary.payments.push({
                     date: lineMatch[1].trim(),
                     amount: parseFloat(lineMatch[2].replace(/,/g, '')),
                     ref: lineMatch[3] ? lineMatch[3].trim() : '',
-                    slipUrl: lineMatch[4] ? lineMatch[4].trim() : ''
+                    slipUrl: (rawUrl && rawUrl !== 'มีสลิป') ? rawUrl : (r.slip_url || '')
                 });
             }
         });
@@ -878,11 +880,12 @@ function buildNoteWithPayment(oldNote, originalAmount, payAmount, refStr, slipUr
     } else {
         const summary = getBillPaymentSummary({ note: oldNote, amount: originalAmount, status: 'รอจ่าย' });
         summary.payments.forEach(p => {
-            historyLines.push(`• ${p.date}: จ่าย ${p.amount.toLocaleString('th-TH', { minimumFractionDigits: 2 })} บาท ${p.ref ? `(${p.ref})` : ''} ${p.slipUrl ? `[สลิป: ${p.slipUrl}]` : ''}`);
+            const slipTag = p.slipUrl ? ' [มีสลิป]' : '';
+            historyLines.push(`• ${p.date}: จ่าย ${p.amount.toLocaleString('th-TH', { minimumFractionDigits: 2 })} บาท ${p.ref ? `(${p.ref})` : ''}${slipTag}`);
         });
     }
     
-    const slipPart = slipUrl ? ` [สลิป: ${slipUrl}]` : '';
+    const slipPart = slipUrl ? ' [มีสลิป]' : '';
     const refPart = refStr ? `(${refStr})` : '';
     historyLines.push(`• ${dateStr}: จ่าย ${payAmount.toLocaleString('th-TH', { minimumFractionDigits: 2 })} บาท ${refPart}${slipPart}`);
     
@@ -1711,17 +1714,85 @@ function createRecordCard(record, isPaid) {
 }
 
 async function confirmPayment(record) {
-    const confirmed = await showConfirmDialog('ยืนยันการโอนเงิน?', `โอนเงินให้ ${record.account_holder} จำนวน ${parseFloat(record.amount || 0).toLocaleString('th-TH', { minimumFractionDigits: 2 })} บาท ใช่หรือไม่?`);
-    if (!confirmed) return;
-    showToast('⏳ กำลังบันทึก...', 'loading');
-    try {
-        const summary = getBillPaymentSummary(record);
-        const newNote = buildNoteWithPayment(record.note, summary.originalAmount, summary.remainingAmount, 'โอนตรง (ไม่มีสลิป)', '', true);
-        await sb.update(record.bill_id, { status: 'จ่ายแล้ว', paid_at: new Date().toISOString(), note: newNote }); 
-        await loadAllRecords(); 
-        showToast('✅ ยืนยันการโอนเงินสำเร็จ', 'success'); 
-    }
-    catch (err) { showToast('❌ เกิดข้อผิดพลาด: ' + err.message, 'error'); }
+    const amountStr = parseFloat(record.amount || 0).toLocaleString('th-TH', { minimumFractionDigits: 2 });
+    const overlay = document.createElement('div');
+    overlay.id = 'direct-pay-modal-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1050;display:flex;align-items:center;justify-content:center;padding:20px;animation:fadeIn 0.2s;';
+    
+    const dialog = document.createElement('div');
+    dialog.style.cssText = 'background:#ffffff;border-radius:16px;padding:28px;max-width:480px;width:95%;box-shadow:0 20px 60px rgba(0,0,0,0.3);animation:slideUp 0.3s;';
+    
+    dialog.innerHTML = `
+        <div class="flex justify-between items-center mb-4">
+            <h3 class="font-bold text-slate-800 text-xl flex items-center gap-2">
+                💳 ยืนยันการโอนเงิน (ไม่มีสลิป)
+            </h3>
+            <button class="close-dp-modal text-slate-400 hover:text-rose-500 text-2xl font-bold border-none bg-transparent cursor-pointer">&times;</button>
+        </div>
+        
+        <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 mb-4 text-sm space-y-1.5">
+            <div class="flex justify-between">
+                <span class="text-slate-500 font-medium">ชื่อผู้รับเงิน:</span>
+                <span class="font-bold text-slate-800">${record.account_holder || record.bill_name || '-'}</span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-slate-500 font-medium">ธนาคาร / บัญชี:</span>
+                <span class="font-semibold text-slate-700">${record.bank_name || '-'} ${record.bank_account || ''}</span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-slate-500 font-medium">รหัสบิล:</span>
+                <span class="font-bold text-indigo-600">${record.bill_id} ${record.document_number ? `(${record.document_number})` : ''}</span>
+            </div>
+            <div class="flex justify-between pt-2 border-t border-slate-200 text-base">
+                <span class="font-bold text-slate-700">ยอดเงินตัดจ่าย:</span>
+                <span class="font-black text-emerald-600">${amountStr} บาท</span>
+            </div>
+        </div>
+        
+        <div class="mb-5">
+            <label class="block font-semibold text-sm text-slate-700 mb-1.5">
+                📝 หมายเหตุการโอน / โน้ตย่อ <span class="text-xs font-normal text-slate-400">(ระบุวันที่โอน หรือข้อความบันทึก)</span>
+            </label>
+            <input type="text" id="dp-note-input" class="w-full px-4 py-2.5 rounded-lg border-2 border-slate-200 text-sm focus:border-indigo-500 focus:outline-none" placeholder="เช่น โอนแล้วเมื่อวันที่ 05/09/69 (เว้นว่างไว้ได้)">
+        </div>
+        
+        <div class="flex gap-3">
+            <button id="dp-confirm-btn" class="flex-1 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-lg transition-all shadow-md cursor-pointer border-none text-base">
+                ✅ ยืนยันการโอนเงิน
+            </button>
+            <button class="close-dp-modal px-5 py-3 bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold rounded-lg transition-all cursor-pointer border-none text-base">
+                ❌ ยกเลิก
+            </button>
+        </div>
+    `;
+    
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    
+    const close = () => { if (document.body.contains(overlay)) document.body.removeChild(overlay); };
+    dialog.querySelectorAll('.close-dp-modal').forEach(btn => btn.addEventListener('click', close));
+    
+    document.getElementById('dp-confirm-btn').addEventListener('click', async () => {
+        const btn = document.getElementById('dp-confirm-btn');
+        btn.disabled = true;
+        btn.textContent = 'กำลังบันทึก...';
+        
+        const noteVal = document.getElementById('dp-note-input').value.trim();
+        const refStr = noteVal ? noteVal : 'โอนตรง (ไม่มีสลิป)';
+        
+        try {
+            const summary = getBillPaymentSummary(record);
+            const newNote = buildNoteWithPayment(record.note, summary.originalAmount, summary.remainingAmount, refStr, '', true);
+            await sb.update(record.bill_id, { status: 'จ่ายแล้ว', paid_at: new Date().toISOString(), note: newNote });
+            close();
+            await loadAllRecords();
+            showToast('✅ ยืนยันการโอนเงินสำเร็จ', 'success');
+        } catch (err) {
+            btn.disabled = false;
+            btn.textContent = '✅ ยืนยันการโอนเงิน';
+            showToast('❌ เกิดข้อผิดพลาด: ' + err.message, 'error');
+        }
+    });
 }
 
 async function confirmPaymentWithSlip(record) {
@@ -1870,7 +1941,7 @@ const drawRow = (label, value, isBold = false, color = '#000000', fontSize = 65)
     ctx.fillStyle = '#000000'; ctx.textAlign = 'right'; ctx.fillText(amtText, rightX, yPos);
     const qrY = boxY + boxHeight + 120;
     ctx.setLineDash([20, 15]); ctx.strokeStyle = '#cccccc'; ctx.beginPath(); ctx.moveTo(200, qrY - 40); ctx.lineTo(width - 200, qrY - 40); ctx.stroke(); ctx.setLineDash([]);
-    const statusUrl = `https://rubbertreeindustry059.github.io/wood-RTI/status.html?id=${encodeURIComponent(record.bill_id)}`;
+    const statusUrl = `${STATUS_PAGE_URL}?id=${encodeURIComponent(record.bill_id)}`;
     try {
         const qrDataUrl = await QRCode.toDataURL(statusUrl, { width: 450, margin: 2, color: { dark: '#000000', light: '#ffffff' } });
         const qrImg = new Image(); await new Promise(res => { qrImg.onload = res; qrImg.src = qrDataUrl; }); ctx.drawImage(qrImg, (width / 2) - 225, qrY);
@@ -1921,7 +1992,7 @@ function printThermal(record) {
     const amount = parseFloat(record.amount || 0).toLocaleString('th-TH', { minimumFractionDigits: 2 });
     const dateStr = record.created_at ? new Date(record.created_at).toLocaleString('th-TH', { dateStyle: 'short', timeStyle: 'short' }) : '-';
     const paidStr = record.paid_at ? new Date(record.paid_at).toLocaleString('th-TH', { dateStyle: 'short', timeStyle: 'short' }) : '-';
-    const qrUrl = `https://rubbertreeindustry059.github.io/wood-RTI/status.html?id=${encodeURIComponent(record.bill_id)}`;
+    const qrUrl = `${STATUS_PAGE_URL}?id=${encodeURIComponent(record.bill_id)}`;
     const maskAccount = acc => { if (!acc) return '-'; const s = acc.toString().replace(/\s/g, ''); return s.length <= 4 ? s : 'x'.repeat(s.length - 4) + s.slice(-4); };
     const pw = safeWindowOpen('พิมพ์สลิปความร้อน');
     if (!pw) return;
